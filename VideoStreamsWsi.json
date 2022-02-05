@@ -1,0 +1,24 @@
+{
+	"file_format_version" : "1.1.2",
+	"layer" : {
+		"name": "VK_LAYER_window_system_integration",
+		"type": "GLOBAL",
+		"library_path": "./VideoStreamsWsi.so",
+		"api_version": "1.0.0",
+		"implementation_version": "1",
+		"description": "VideoStreamsWsi",
+		"instance_extensions": [
+			{"name" : "VK_EXT_headless_surface", "spec_version" : "1"},
+			{"name" : "VK_KHR_surface", "spec_version" : "1"}
+		],
+		"device_extensions": [
+			{"name" : "VK_KHR_swapchain", "spec_version" : "1"}
+		],
+		"pre_instance_functions" : {
+			"vkEnumerateInstanceExtensionProperties" : "vkEnumerateInstanceExtensionProperties"
+		},
+		"disable_environment": {
+			"DISABLE_VIDEOSTREAMS_WSI_LAYER": "1"
+		}
+	}
+}
