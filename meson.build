@@ -20,6 +20,6 @@ shared_library('VideoStreamsWsi',
 	dependencies: [
 		compiler.find_library('be'),
 	],
-#	gnu_symbol_visibility: 'hidden',
+	gnu_symbol_visibility: 'hidden',
 	install : true
 )

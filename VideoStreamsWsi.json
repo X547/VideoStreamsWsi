@@ -4,7 +4,7 @@
 		"name": "VK_LAYER_window_system_integration",
 		"type": "GLOBAL",
 		"library_path": "./VideoStreamsWsi.so",
-		"api_version": "1.0.0",
+		"api_version": "1.2.0",
 		"implementation_version": "1",
 		"description": "VideoStreamsWsi",
 		"instance_extensions": [

@@ -667,8 +667,7 @@ VkResult VKLayerSwapchain::AcquireNextImage(const VkAcquireNextImageInfoKHR *pAc
 	
 		submit.commandBufferCount = 0;
 		submit.pCommandBuffers = nullptr;
-		VkResult retval = fDevice->Hooks().QueueSubmit(fQueue, 1, &submit, pAcquireInfo->fence);
-		assert(retval == VK_SUCCESS);
+		VkCheckRet(fDevice->Hooks().QueueSubmit(fQueue, 1, &submit, pAcquireInfo->fence));
 	}
 
 	return CheckSuboptimal();
