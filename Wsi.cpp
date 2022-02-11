@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 #include <new>
 #include <algorithm>
 #include <cassert>
@@ -86,20 +87,22 @@ class BufferQueue {
 private:
 	ArrayDeleter<int32> fItems;
 	int32 fBeg, fLen, fMaxLen;
+	pthread_mutex_t fLock;
+	pthread_cond_t fEmptyCv, fFullCv;
 
 public:
-	BufferQueue(int32 maxLen = 0);
+	BufferQueue();
 	bool SetMaxLen(int32 maxLen);
 
-	inline int32 Length() {return fLen;}
 	bool Add(int32 val);
 	int32 Remove();
-	int32 Begin();
 };
 
-BufferQueue::BufferQueue(int32 maxLen):
-	fItems((maxLen > 0) ? new int32[maxLen] : NULL),
-	fBeg(0), fLen(0), fMaxLen(maxLen)
+BufferQueue::BufferQueue():
+	fItems(NULL),
+	fBeg(0), fLen(0), fMaxLen(0),
+	fLock(PTHREAD_RECURSIVE_MUTEX_INITIALIZER),
+	fEmptyCv(PTHREAD_COND_INITIALIZER), fFullCv(PTHREAD_COND_INITIALIZER)
 {}
 
 bool BufferQueue::SetMaxLen(int32 maxLen)
@@ -120,28 +123,23 @@ bool BufferQueue::SetMaxLen(int32 maxLen)
 
 bool BufferQueue::Add(int32 val)
 {
+	PthreadMutexLocker lock(&fLock);
 	if (!(fLen < fMaxLen))
 		return false;
 	fItems[(fBeg + fLen)%fMaxLen] = val;
+	if (fLen == 0) pthread_cond_signal(&fEmptyCv);
 	fLen++;
 	return true;
 }
 
 int32 BufferQueue::Remove()
 {
-	if (!(fLen > 0))
-		return -1;
+	PthreadMutexLocker lock(&fLock);
+	while (!(fLen > 0)) pthread_cond_wait(&fEmptyCv, &fLock);
 	int32 res = fItems[fBeg%fMaxLen];
 	fBeg = (fBeg + 1)%fMaxLen;
 	fLen--;
 	return res;
-}
-
-int32 BufferQueue::Begin()
-{
-	if (!(fLen > 0))
-		return -1;
-	return fItems[fBeg%fMaxLen];
 }
 
 
@@ -199,7 +197,6 @@ public:
 
 class VKLayerSwapchain {
 private:
-	pthread_mutex_t fLock;
 	LayerDevice *fDevice;
 	VKLayerSurface *fSurface;
 	VkExtent2D fImageExtent;
@@ -422,7 +419,6 @@ void VKLayerSurface::SetBitmapHook(BitmapHook *hook)
 //#pragma mark - VKLayerSwapchain
 
 VKLayerSwapchain::VKLayerSwapchain():
-	fLock(PTHREAD_RECURSIVE_MUTEX_INITIALIZER),
 	fCommandPool(VK_NULL_HANDLE),
 	fFence(VK_NULL_HANDLE)
 {
@@ -601,8 +597,7 @@ VkResult VKLayerSwapchain::Init(LayerDevice *device, const VkSwapchainCreateInfo
 	VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, 0};
 	VkCheckRet(fDevice->Hooks().CreateFence(fDevice->ToHandle(), &fence_info, NULL, &fFence));
 
-	fImageExtent.width = createInfo.imageExtent.width;
-	fImageExtent.height = createInfo.imageExtent.height;
+	fImageExtent = createInfo.imageExtent;
 
 	VkImageCreateInfo imageCreateInfo = ImageFromCreateInfo(createInfo);
 
@@ -643,18 +638,7 @@ VkResult VKLayerSwapchain::GetSwapchainImages(uint32_t *count, VkImage *images)
 
 VkResult VKLayerSwapchain::AcquireNextImage(const VkAcquireNextImageInfoKHR *pAcquireInfo, uint32_t *pImageIndex)
 {
-	int32 imageIdx;
-	for(;;) {
-		{
-			PthreadMutexLocker lock(&fLock);
-			imageIdx = fImagePool.Remove();
-		}
-		if (imageIdx < 0) {
-			snooze(100);
-			continue;
-		}
-		break;
-	};
+	int32 imageIdx = fImagePool.Remove();
 	*pImageIndex = imageIdx;
 
 	if (VK_NULL_HANDLE != pAcquireInfo->semaphore || VK_NULL_HANDLE != pAcquireInfo->fence) {
@@ -687,9 +671,8 @@ VkResult VKLayerSwapchain::QueuePresent(VkQueue queue, const VkPresentInfoKHR *p
 		fDevice->Hooks().WaitForFences(fDevice->ToHandle(), 1, &fFence, VK_TRUE, UINT64_MAX);
 	}
 
-	PthreadMutexLocker lock(&fLock);
 	uint32_t imageIdx = presentInfo->pImageIndices[idx];
-	fImagePool.Add(imageIdx);
+	assert(fImagePool.Add(imageIdx));
 
 	auto bitmapHook = fSurface->GetBitmapHook();
 	if (bitmapHook != NULL) {
