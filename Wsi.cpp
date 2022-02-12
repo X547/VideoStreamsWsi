@@ -672,7 +672,7 @@ VkResult VKLayerSwapchain::QueuePresent(VkQueue queue, const VkPresentInfoKHR *p
 	}
 
 	uint32_t imageIdx = presentInfo->pImageIndices[idx];
-	assert(fImagePool.Add(imageIdx));
+	/*assert(*/fImagePool.Add(imageIdx)/*)*/;
 
 	auto bitmapHook = fSurface->GetBitmapHook();
 	if (bitmapHook != NULL) {
