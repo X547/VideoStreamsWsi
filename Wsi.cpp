@@ -156,7 +156,7 @@ private:
 public:
 	VKLayerImage();
 	~VKLayerImage();
-	VkResult Init(LayerDevice *device, const VkImageCreateInfo &createInfo, bool cpuMem = false, area_id *area = NULL);
+	VkResult Init(LayerDevice *device, const VkImageCreateInfo &createInfo, bool cpuMem = false, BBitmap **bitmap = NULL);
 
 	VkImage ToHandle() {return fImage;}
 	VkDeviceMemory GetMemoryHandle() {return fMemory;}
@@ -249,7 +249,7 @@ VKLayerImage::~VKLayerImage()
 	fDevice->Hooks().FreeMemory(fDevice->ToHandle(), fMemory, NULL);
 }
 
-VkResult VKLayerImage::Init(LayerDevice *device, const VkImageCreateInfo &createInfo, bool cpuMem, area_id *area)
+VkResult VKLayerImage::Init(LayerDevice *device, const VkImageCreateInfo &createInfo, bool cpuMem, BBitmap **bitmap)
 {
 	fDevice = device;
 
@@ -275,16 +275,18 @@ VkResult VKLayerImage::Init(LayerDevice *device, const VkImageCreateInfo &create
 	};
 
 	VkImportMemoryHostPointerInfoEXT hostPtrInfo;
-	AreaDeleter memArea;
-	if (area != NULL) {
-		void *memAreaAdr = NULL;
-		memArea.SetTo(create_area("WSI image", &memAreaAdr, B_ANY_ADDRESS, memRequirements.size, B_FULL_LOCK, B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA));
-		if (!memArea.IsSet())
+	ObjectDeleter<BBitmap> newBitmap;
+	if (bitmap != NULL) {
+		VkImageSubresource subResource{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT};
+		VkSubresourceLayout subResourceLayout;
+		fDevice->Hooks().GetImageSubresourceLayout(fDevice->ToHandle(), ToHandle(), &subResource, &subResourceLayout);
+		newBitmap.SetTo(new(std::nothrow) BBitmap(BRect(0, 0, createInfo.extent.width - 1, createInfo.extent.height - 1), 0, B_RGBA32, subResourceLayout.rowPitch));
+		if (!newBitmap.IsSet())
 			return VK_ERROR_OUT_OF_HOST_MEMORY;
 		hostPtrInfo = {
 			.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
 			.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-			.pHostPointer = memAreaAdr
+			.pHostPointer = newBitmap->Bits()
 		};
 		memAllocInfo.pNext = &hostPtrInfo;
 	}
@@ -292,7 +294,7 @@ VkResult VKLayerImage::Init(LayerDevice *device, const VkImageCreateInfo &create
 	VkCheckRet(fDevice->Hooks().AllocateMemory(fDevice->ToHandle(), &memAllocInfo, nullptr, &fMemory));
 	VkCheckRet(fDevice->Hooks().BindImageMemory(fDevice->ToHandle(), fImage, fMemory, 0));
 
-	if (area != NULL) {*area = memArea.Detach();}
+	if (bitmap != NULL) {*bitmap = newBitmap.Detach();}
 	return VK_SUCCESS;
 }
 
@@ -492,16 +494,9 @@ VkResult VKLayerSwapchain::CreateBuffer()
 	fBuffer.SetTo(new(std::nothrow) VKLayerImage());
 	if (!fBuffer.IsSet())
 		return VK_ERROR_OUT_OF_HOST_MEMORY;
-	area_id area;
-	VkCheckRet(fBuffer->Init(fDevice, createInfo, true, &area));
-	fBitmapArea.SetTo(area);
-
-	VkImageSubresource subResource{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT};
-	VkSubresourceLayout subResourceLayout;
-	fDevice->Hooks().GetImageSubresourceLayout(fDevice->ToHandle(), fBuffer->ToHandle(), &subResource, &subResourceLayout);
-	fBitmap.SetTo(new(std::nothrow) BBitmap(fBitmapArea.Get(), 0, BRect(0, 0, fImageExtent.width - 1, fImageExtent.height - 1), B_BITMAP_IS_AREA, B_RGB32, subResourceLayout.rowPitch));
-	if (!fBitmap.IsSet())
-		return VK_ERROR_OUT_OF_HOST_MEMORY;
+	BBitmap *newBitmap;
+	VkCheckRet(fBuffer->Init(fDevice, createInfo, true, &newBitmap));
+	fBitmap.SetTo(newBitmap);
 	fCurBitmap = fBitmap.Get();
 
 	return VK_SUCCESS;
@@ -667,7 +662,7 @@ VkResult VKLayerSwapchain::AcquireNextImage(const VkAcquireNextImageInfoKHR *pAc
 			submit.signalSemaphoreCount = 1;
 			submit.pSignalSemaphores = &pAcquireInfo->semaphore;
 		}
-	
+
 		submit.commandBufferCount = 0;
 		submit.pCommandBuffers = nullptr;
 		VkCheckRet(fDevice->Hooks().QueueSubmit(fQueue, 1, &submit, pAcquireInfo->fence));
