@@ -145,6 +145,8 @@ int32 BufferQueue::Remove()
 
 //#pragma mark -
 
+class VKLayerSwapchain;
+
 class VKLayerImage {
 private:
 	LayerDevice *fDevice;
@@ -175,8 +177,11 @@ public:
 
 class VKLayerSurface: public VKLayerSurfaceBase {
 private:
-	LayerInstance *fInstance;
-	BitmapHook *fBitmapHook;
+	LayerInstance *fInstance = NULL;
+	VKLayerSwapchain *fSwapchain = NULL;
+	BitmapHook *fBitmapHook = NULL;
+
+	friend class VKLayerSwapchain;
 
 public:
 	VKLayerSurface();
@@ -204,9 +209,10 @@ private:
 	ArrayDeleter<VKLayerImage> fImages;
 	BufferQueue fImagePool;
 	ObjectDeleter<VKLayerImage> fBuffer;
-	VkCommandPool fCommandPool;
-	VkQueue fQueue;
-	VkFence fFence;
+	VkCommandPool fCommandPool = VK_NULL_HANDLE;
+	VkQueue fQueue = VK_NULL_HANDLE;
+	VkFence fFence = VK_NULL_HANDLE;
+	bool fRetired = false;
 
 	ObjectDeleter<BBitmap> fBitmap;
 	AreaDeleter fBitmapArea;
@@ -293,12 +299,11 @@ VkResult VKLayerImage::Init(LayerDevice *device, const VkImageCreateInfo &create
 
 //#pragma mark - VKLayerSurface
 
-VKLayerSurface::VKLayerSurface(): fInstance(NULL), fBitmapHook(NULL)
+VKLayerSurface::VKLayerSurface()
 {}
 
 VKLayerSurface::~VKLayerSurface()
-{
-}
+{}
 
 VkResult VKLayerSurface::Init(LayerInstance *instance, const VkHeadlessSurfaceCreateInfoEXT &createInfo)
 {
@@ -418,11 +423,8 @@ void VKLayerSurface::SetBitmapHook(BitmapHook *hook)
 
 //#pragma mark - VKLayerSwapchain
 
-VKLayerSwapchain::VKLayerSwapchain():
-	fCommandPool(VK_NULL_HANDLE),
-	fFence(VK_NULL_HANDLE)
-{
-}
+VKLayerSwapchain::VKLayerSwapchain()
+{}
 
 VKLayerSwapchain::~VKLayerSwapchain()
 {
@@ -432,6 +434,10 @@ VKLayerSwapchain::~VKLayerSwapchain()
 	}
 
 	fDevice->Hooks().DestroyFence(fDevice->ToHandle(), fFence, NULL);
+
+	if (!fRetired) {
+		fSurface->fSwapchain = NULL;
+	}
 }
 
 VkImageCreateInfo VKLayerSwapchain::ImageFromCreateInfo(const VkSwapchainCreateInfoKHR &createInfo)
@@ -594,6 +600,14 @@ VkResult VKLayerSwapchain::Init(LayerDevice *device, const VkSwapchainCreateInfo
 	fDevice = device;
 	fSurface = VKLayerSurface::FromHandle(createInfo.surface);
 
+	VKLayerSwapchain *oldSwapchain = NULL;
+	if (createInfo.oldSwapchain != NULL) {
+		if (fSurface->fSwapchain == NULL || createInfo.oldSwapchain != fSurface->fSwapchain->ToHandle()) {
+			return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
+		}
+		oldSwapchain = VKLayerSwapchain::FromHandle(createInfo.oldSwapchain);
+	}
+
 	VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, 0};
 	VkCheckRet(fDevice->Hooks().CreateFence(fDevice->ToHandle(), &fence_info, NULL, &fFence));
 
@@ -617,6 +631,11 @@ VkResult VKLayerSwapchain::Init(LayerDevice *device, const VkSwapchainCreateInfo
 	//VkCheckRet(vkSetDeviceLoaderData(device, fQueue));
 
 	VkCheckRet(CreateBuffer());
+
+	if (oldSwapchain != NULL) {
+		oldSwapchain->fRetired = true;
+	}
+	fSurface->fSwapchain = this;
 
 	return VK_SUCCESS;
 }
