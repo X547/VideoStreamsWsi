@@ -21,5 +21,11 @@ shared_library('VideoStreamsWsi',
 		compiler.find_library('be'),
 	],
 	gnu_symbol_visibility: 'hidden',
-	install : true
+	install_dir: 'add-ons/vulkan/implicit_layer.d',
+	install: true
+)
+
+install_data(
+	'VideoStreamsWsi.json',
+	install_dir: 'add-ons/vulkan/implicit_layer.d',
 )
