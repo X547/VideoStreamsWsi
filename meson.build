@@ -19,6 +19,8 @@ shared_library('VideoStreamsWsi',
 	],
 	dependencies: [
 		compiler.find_library('be'),
+		dependency('libvideostreams'),
+		dependency('libdrm'),
 	],
 	gnu_symbol_visibility: 'hidden',
 	install_dir: 'add-ons/vulkan/implicit_layer.d',

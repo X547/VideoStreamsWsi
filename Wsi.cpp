@@ -2,6 +2,8 @@
 
 #include <OS.h>
 
+#include <VideoStreams/VideoProducer.h>
+
 #include <private/shared/AutoDeleter.h>
 #include <private/shared/AutoDeleterOS.h>
 #include <private/shared/PthreadMutexLocker.h>
@@ -13,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 
+#include <Looper.h>
 #include <Bitmap.h>
 
 
@@ -81,9 +84,9 @@ static VkResult submitWork(LayerDevice *lrDev, VkCommandBuffer cmdBuffer, VkQueu
 }
 
 
-//#pragma mark - BufferQueue
+//#pragma mark - BufferQueue2
 
-class BufferQueue {
+class BufferQueue2 {
 private:
 	ArrayDeleter<int32> fItems;
 	int32 fBeg, fLen, fMaxLen;
@@ -91,21 +94,21 @@ private:
 	pthread_cond_t fEmptyCv, fFullCv;
 
 public:
-	BufferQueue();
+	BufferQueue2();
 	bool SetMaxLen(int32 maxLen);
 
 	bool Add(int32 val);
 	int32 Remove();
 };
 
-BufferQueue::BufferQueue():
+BufferQueue2::BufferQueue2():
 	fItems(NULL),
 	fBeg(0), fLen(0), fMaxLen(0),
 	fLock(PTHREAD_RECURSIVE_MUTEX_INITIALIZER),
 	fEmptyCv(PTHREAD_COND_INITIALIZER), fFullCv(PTHREAD_COND_INITIALIZER)
 {}
 
-bool BufferQueue::SetMaxLen(int32 maxLen)
+bool BufferQueue2::SetMaxLen(int32 maxLen)
 {
 	if (!(maxLen > 0)) {
 		fItems.Unset();
@@ -121,7 +124,7 @@ bool BufferQueue::SetMaxLen(int32 maxLen)
 }
 
 
-bool BufferQueue::Add(int32 val)
+bool BufferQueue2::Add(int32 val)
 {
 	PthreadMutexLocker lock(&fLock);
 	if (!(fLen < fMaxLen))
@@ -132,7 +135,7 @@ bool BufferQueue::Add(int32 val)
 	return true;
 }
 
-int32 BufferQueue::Remove()
+int32 BufferQueue2::Remove()
 {
 	PthreadMutexLocker lock(&fLock);
 	while (!(fLen > 0)) pthread_cond_wait(&fEmptyCv, &fLock);
@@ -175,11 +178,12 @@ public:
 	virtual void SetBitmapHook(BitmapHook *hook) = 0;
 };
 
-class VKLayerSurface: public VKLayerSurfaceBase {
+class VKLayerSurface: public VKLayerSurfaceBase, public VideoProducer {
 private:
 	LayerInstance *fInstance = NULL;
 	VKLayerSwapchain *fSwapchain = NULL;
 	BitmapHook *fBitmapHook = NULL;
+	BLooper *fLooper = NULL;
 
 	friend class VKLayerSwapchain;
 
@@ -197,7 +201,13 @@ public:
 	VkSurfaceKHR ToHandle() {return (VkSurfaceKHR)this;}
 
 	BitmapHook *GetBitmapHook() {return fBitmapHook;}
+	// VKLayerSurfaceBase
 	void SetBitmapHook(BitmapHook *hook) override;
+
+	// VideoProducer
+	void Connected(bool isActive) final;
+	void SwapChainChanged(bool isValid) final;
+	void Presented() final;
 };
 
 class VKLayerSwapchain {
@@ -207,7 +217,7 @@ private:
 	VkExtent2D fImageExtent;
 	uint32 fImageCnt;
 	ArrayDeleter<VKLayerImage> fImages;
-	BufferQueue fImagePool;
+	BufferQueue2 fImagePool;
 	ObjectDeleter<VKLayerImage> fBuffer;
 	VkCommandPool fCommandPool = VK_NULL_HANDLE;
 	VkQueue fQueue = VK_NULL_HANDLE;
@@ -303,12 +313,19 @@ VKLayerSurface::VKLayerSurface()
 {}
 
 VKLayerSurface::~VKLayerSurface()
-{}
+{
+	fLooper->Quit();
+}
 
 VkResult VKLayerSurface::Init(LayerInstance *instance, const VkHeadlessSurfaceCreateInfoEXT &createInfo)
 {
 	(void)createInfo;
 	fInstance = instance;
+
+	fLooper = new BLooper("VKLayerSurface");
+	fLooper->AddHandler(this);
+	fLooper->Run();
+
 	return VK_SUCCESS;
 }
 
@@ -319,8 +336,8 @@ VkResult VKLayerSurface::GetCapabilities(VkPhysicalDevice physDev, VkSurfaceCapa
 	surfaceCapabilities->maxImageCount = 3;
 
 	/* Surface extents */
-	if (fBitmapHook != NULL)
-		fBitmapHook->GetSize(surfaceCapabilities->currentExtent.width, surfaceCapabilities->currentExtent.height);
+	if (true)
+		surfaceCapabilities->currentExtent = {1920, 1080};
 	else
 		surfaceCapabilities->currentExtent = {(uint32_t)-1, (uint32_t)-1};
 
@@ -418,6 +435,22 @@ VkResult VKLayerSurface::GetPresentRectangles(VkPhysicalDevice physDev, uint32_t
 void VKLayerSurface::SetBitmapHook(BitmapHook *hook)
 {
 	fBitmapHook = hook;
+}
+
+
+//#pragma mark - VideoProducer interface
+
+void VKLayerSurface::Connected(bool isActive)
+{
+}
+
+void VKLayerSurface::SwapChainChanged(bool isValid)
+{
+	VideoProducer::SwapChainChanged(isValid);
+}
+
+void VKLayerSurface::Presented()
+{
 }
 
 
@@ -636,6 +669,19 @@ VkResult VKLayerSwapchain::Init(LayerDevice *device, const VkSwapchainCreateInfo
 		oldSwapchain->fRetired = true;
 	}
 	fSurface->fSwapchain = this;
+
+	if (false) {
+		fSurface->LockLooper();
+		SwapChainSpec spec {
+			.size = sizeof(SwapChainSpec),
+			.presentEffect = presentEffectSwap,
+			.bufferCnt = 2,
+			.kind = bufferRefGpu,
+			.colorSpace = B_RGBA32,
+		};
+		fSurface->RequestSwapChain(spec);
+		fSurface->UnlockLooper();
+	}
 
 	return VK_SUCCESS;
 }
