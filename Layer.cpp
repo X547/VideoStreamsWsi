@@ -118,10 +118,22 @@ VkResult LayerDevice::Init(VkPhysicalDevice physicalDevice, const VkDeviceCreate
   fHooks.GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)fHooks.GetDeviceProcAddr(fBaseDevice, "vkGetDeviceProcAddr");
   fHooks.CreateDevice = (PFN_vkCreateDevice)fHooks.GetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateDevice");
 
-	VkCheckRet(fHooks.CreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice));
+	const char *layerExtensions[] {
+		VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+	};
+
+	VkDeviceCreateInfo createInfoOverride;
+	memcpy(&createInfoOverride, pCreateInfo, sizeof(createInfoOverride));
+	createInfoOverride.enabledExtensionCount += B_COUNT_OF(layerExtensions);
+	ArrayDeleter<const char*> extensionsOverride(new const char*[B_COUNT_OF(layerExtensions)]);
+	createInfoOverride.ppEnabledExtensionNames = &extensionsOverride[0];
+	memcpy(&extensionsOverride[0], pCreateInfo->ppEnabledExtensionNames, pCreateInfo->enabledExtensionCount * sizeof(const char*));
+	memcpy(&extensionsOverride[pCreateInfo->enabledExtensionCount], layerExtensions, B_COUNT_OF(layerExtensions) * sizeof(const char*));
+
+	VkCheckRet(fHooks.CreateDevice(physicalDevice, &createInfoOverride, pAllocator, pDevice));
 	fBaseDevice = *pDevice;
 
-#define REQUIRED(x) fHooks.x = (PFN_vk##x)fHooks.GetDeviceProcAddr(fBaseDevice, "vk" #x);
+#define REQUIRED(x) fHooks.x = (PFN_vk##x)fHooks.GetDeviceProcAddr(fBaseDevice, "vk" #x); if (fHooks.x == NULL) {fprintf(stderr, "[!] no function %s\n", "vk" #x); return VK_ERROR_INITIALIZATION_FAILED;}
 #define OPTIONAL(x)
 	DEVICE_HOOK_LIST(REQUIRED, OPTIONAL);
 #undef REQUIRED
