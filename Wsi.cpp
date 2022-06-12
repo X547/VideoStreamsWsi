@@ -18,6 +18,40 @@
 #include <Looper.h>
 #include <Bitmap.h>
 
+#include <xf86drm.h>
+
+//#define AUTO_CONNECT_TO_SCREEN 1
+
+
+#ifdef AUTO_CONNECT_TO_SCREEN
+static bool FindConsumerGfx(BMessenger& consumer)
+{
+	BMessenger consumerApp("application/x-vnd.X512-RadeonGfx");
+	if (!consumerApp.IsValid()) {
+		printf("[!] No TestConsumer\n");
+		return false;
+	}
+	for (int32 i = 0; ; i++) {
+		BMessage reply;
+		{
+			BMessage scriptMsg(B_GET_PROPERTY);
+			scriptMsg.AddSpecifier("Handler", i);
+			consumerApp.SendMessage(&scriptMsg, &reply);
+		}
+		int32 error;
+		if (reply.FindInt32("error", &error) >= B_OK && error < B_OK)
+			return false;
+		if (reply.FindMessenger("result", &consumer) >= B_OK) {
+			BMessage scriptMsg(B_GET_PROPERTY);
+			scriptMsg.AddSpecifier("InternalName");
+			consumer.SendMessage(&scriptMsg, &reply);
+			const char* name;
+			if (reply.FindString("result", &name) >= B_OK && strcmp(name, "RadeonGfxConsumer") == 0)
+				return true;
+		}
+	}
+}
+#endif
 
 static uint32_t getMemoryTypeIndex(LayerDevice *lrDev, uint32_t typeBits, VkMemoryPropertyFlags properties)
 {
@@ -84,68 +118,6 @@ static VkResult submitWork(LayerDevice *lrDev, VkCommandBuffer cmdBuffer, VkQueu
 }
 
 
-//#pragma mark - BufferQueue2
-
-class BufferQueue2 {
-private:
-	ArrayDeleter<int32> fItems;
-	int32 fBeg, fLen, fMaxLen;
-	pthread_mutex_t fLock;
-	pthread_cond_t fEmptyCv, fFullCv;
-
-public:
-	BufferQueue2();
-	bool SetMaxLen(int32 maxLen);
-
-	bool Add(int32 val);
-	int32 Remove();
-};
-
-BufferQueue2::BufferQueue2():
-	fItems(NULL),
-	fBeg(0), fLen(0), fMaxLen(0),
-	fLock(PTHREAD_RECURSIVE_MUTEX_INITIALIZER),
-	fEmptyCv(PTHREAD_COND_INITIALIZER), fFullCv(PTHREAD_COND_INITIALIZER)
-{}
-
-bool BufferQueue2::SetMaxLen(int32 maxLen)
-{
-	if (!(maxLen > 0)) {
-		fItems.Unset();
-	} else {
-		auto newItems = new(std::nothrow) int32[maxLen];
-		if (newItems == NULL)
-			return false;
-		fItems.SetTo(newItems);
-	}
-	fMaxLen = maxLen;
-	fBeg = 0; fLen = 0; fMaxLen = maxLen;
-	return true;
-}
-
-
-bool BufferQueue2::Add(int32 val)
-{
-	PthreadMutexLocker lock(&fLock);
-	if (!(fLen < fMaxLen))
-		return false;
-	fItems[(fBeg + fLen)%fMaxLen] = val;
-	if (fLen == 0) pthread_cond_signal(&fEmptyCv);
-	fLen++;
-	return true;
-}
-
-int32 BufferQueue2::Remove()
-{
-	PthreadMutexLocker lock(&fLock);
-	while (!(fLen > 0)) pthread_cond_wait(&fEmptyCv, &fLock);
-	int32 res = fItems[fBeg%fMaxLen];
-	fBeg = (fBeg + 1)%fMaxLen;
-	fLen--;
-	return res;
-}
-
-
 //#pragma mark -
 
 class VKLayerSwapchain;
@@ -161,16 +133,13 @@ public:
 	~VKLayerImage();
 	VkResult Init(LayerDevice *device, const VkImageCreateInfo &createInfo, bool cpuMem = false, area_id *area = NULL);
 
+	VkResult ToVideoBuffer(VideoBuffer &vidBuf, VkImageCreateInfo &imgInfo);
+
 	VkImage ToHandle() {return fImage;}
 	VkDeviceMemory GetMemoryHandle() {return fMemory;}
 };
 
-class BitmapHook {
-public:
-	virtual ~BitmapHook() {};
-	virtual void GetSize(uint32_t &width, uint32_t &height) = 0;
-	virtual BBitmap *SetBitmap(BBitmap *bmp) = 0;
-};
+class BitmapHook;
 
 class VKLayerSurfaceBase {
 public:
@@ -182,7 +151,6 @@ class VKLayerSurface: public VKLayerSurfaceBase, public VideoProducer {
 private:
 	LayerInstance *fInstance = NULL;
 	VKLayerSwapchain *fSwapchain = NULL;
-	BitmapHook *fBitmapHook = NULL;
 	BLooper *fLooper = NULL;
 
 	friend class VKLayerSwapchain;
@@ -200,7 +168,6 @@ public:
 	static VKLayerSurface *FromHandle(VkSurfaceKHR surface) {return (VKLayerSurface*)surface;}
 	VkSurfaceKHR ToHandle() {return (VkSurfaceKHR)this;}
 
-	BitmapHook *GetBitmapHook() {return fBitmapHook;}
 	// VKLayerSurfaceBase
 	void SetBitmapHook(BitmapHook *hook) override;
 
@@ -217,9 +184,6 @@ private:
 	VkExtent2D fImageExtent;
 	uint32 fImageCnt;
 	ArrayDeleter<VKLayerImage> fImages;
-	BufferQueue2 fImagePool;
-	ObjectDeleter<VKLayerImage> fBuffer;
-	VkCommandPool fCommandPool = VK_NULL_HANDLE;
 	VkQueue fQueue = VK_NULL_HANDLE;
 	VkFence fFence = VK_NULL_HANDLE;
 	bool fRetired = false;
@@ -229,8 +193,6 @@ private:
 	BBitmap *fCurBitmap;
 
 	VkImageCreateInfo ImageFromCreateInfo(const VkSwapchainCreateInfoKHR &createInfo);
-	VkResult CreateBuffer();
-	VkResult CopyToBuffer(VkImage srcImage, int32_t width, int32_t height);
 	VkResult CheckSuboptimal();
 
 public:
@@ -278,8 +240,14 @@ VkResult VKLayerImage::Init(LayerDevice *device, const VkImageCreateInfo &create
 		assert(memTypeIdx <= 8 * sizeof(memRequirements.memoryTypeBits) - 1);
 	}
 
+	VkMemoryDedicatedAllocateInfo dedicateInfo{
+		.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+		.image = fImage,
+	};
+
 	VkMemoryAllocateInfo memAllocInfo{
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.pNext = &dedicateInfo,
 		.allocationSize = memRequirements.size,
 		.memoryTypeIndex = (uint32_t)memTypeIdx
 	};
@@ -306,6 +274,38 @@ VkResult VKLayerImage::Init(LayerDevice *device, const VkImageCreateInfo &create
 	return VK_SUCCESS;
 }
 
+VkResult VKLayerImage::ToVideoBuffer(VideoBuffer &vidBuf, VkImageCreateInfo &imgInfo)
+{
+	VkImageSubresource subresource {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT};
+	VkSubresourceLayout subresourceLayout {};
+	fDevice->Hooks().GetImageSubresourceLayout(fDevice->ToHandle(), ToHandle(), &subresource, &subresourceLayout);
+
+	int memFd = -1;
+	VkMemoryGetFdInfoKHR getFdInfo {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+		.memory = GetMemoryHandle(),
+		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+	};
+	VkResult res = fDevice->Hooks().GetMemoryFdKHR(fDevice->ToHandle(), &getFdInfo, &memFd);
+
+	uint32_t boHandle = UINT32_MAX;
+	int devFd = open("/dev/null", O_RDWR | O_CLOEXEC);
+	drmPrimeFDToHandle(devFd, memFd, &boHandle);
+	close(devFd); devFd = -1;
+
+	vidBuf.ref.offset = subresourceLayout.offset;
+	vidBuf.ref.size = subresourceLayout.size;
+	vidBuf.ref.kind = bufferRefGpu;
+	vidBuf.ref.gpu.id = boHandle;
+	vidBuf.ref.gpu.team = getpid();
+	vidBuf.format.bytesPerRow = subresourceLayout.rowPitch;
+	vidBuf.format.width = imgInfo.extent.width;
+	vidBuf.format.height = imgInfo.extent.height;
+	vidBuf.format.colorSpace = B_RGBA32;
+
+	return VK_SUCCESS;
+}
+
 
 //#pragma mark - VKLayerSurface
 
@@ -325,6 +325,22 @@ VkResult VKLayerSurface::Init(LayerInstance *instance, const VkHeadlessSurfaceCr
 	fLooper = new BLooper("VKLayerSurface");
 	fLooper->AddHandler(this);
 	fLooper->Run();
+
+#ifdef AUTO_CONNECT_TO_SCREEN
+	BMessenger consumer;
+	while (!FindConsumerGfx(consumer)) {
+		snooze(100000);
+	}
+	printf("consumer: "); WriteMessenger(consumer); printf("\n");
+
+	LockLooper();
+	if (ConnectTo(consumer) < B_OK) {
+		UnlockLooper();
+		printf("[!] can't connect to consumer\n");
+		return VK_ERROR_UNKNOWN;
+	}
+	UnlockLooper();
+#endif
 
 	return VK_SUCCESS;
 }
@@ -434,7 +450,6 @@ VkResult VKLayerSurface::GetPresentRectangles(VkPhysicalDevice physDev, uint32_t
 
 void VKLayerSurface::SetBitmapHook(BitmapHook *hook)
 {
-	fBitmapHook = hook;
 }
 
 
@@ -442,6 +457,7 @@ void VKLayerSurface::SetBitmapHook(BitmapHook *hook)
 
 void VKLayerSurface::Connected(bool isActive)
 {
+	VideoProducer::Connected(isActive);
 }
 
 void VKLayerSurface::SwapChainChanged(bool isValid)
@@ -451,6 +467,7 @@ void VKLayerSurface::SwapChainChanged(bool isValid)
 
 void VKLayerSurface::Presented()
 {
+	VideoProducer::Presented();
 }
 
 
@@ -461,11 +478,6 @@ VKLayerSwapchain::VKLayerSwapchain()
 
 VKLayerSwapchain::~VKLayerSwapchain()
 {
-	if (fCommandPool != VK_NULL_HANDLE) {
-		fDevice->Hooks().DestroyCommandPool(fDevice->ToHandle(), fCommandPool, nullptr);
-		fDevice->Hooks().QueueWaitIdle(fQueue);
-	}
-
 	fDevice->Hooks().DestroyFence(fDevice->ToHandle(), fFence, NULL);
 
 	if (!fRetired) {
@@ -488,7 +500,7 @@ VkImageCreateInfo VKLayerSwapchain::ImageFromCreateInfo(const VkSwapchainCreateI
 		.mipLevels = 1,
 		.arrayLayers = createInfo.imageArrayLayers,
 		.samples = VK_SAMPLE_COUNT_1_BIT,
-		.tiling = VK_IMAGE_TILING_OPTIMAL,
+		.tiling = VK_IMAGE_TILING_LINEAR,
 		.usage = createInfo.imageUsage,
 		.sharingMode = createInfo.imageSharingMode,
 		.queueFamilyIndexCount = createInfo.queueFamilyIndexCount,
@@ -497,125 +509,9 @@ VkImageCreateInfo VKLayerSwapchain::ImageFromCreateInfo(const VkSwapchainCreateI
 	};
 }
 
-VkResult VKLayerSwapchain::CreateBuffer()
-{
-	VkCommandPoolCreateInfo cmdPoolInfo{
-		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-		.queueFamilyIndex = 0
-	};
-	VkCheckRet(fDevice->Hooks().CreateCommandPool(fDevice->ToHandle(), &cmdPoolInfo, nullptr, &fCommandPool));
-
-	VkImageCreateInfo createInfo{
-		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-		.imageType = VK_IMAGE_TYPE_2D,
-		.format = VK_FORMAT_B8G8R8A8_UNORM,
-		.extent = {
-			.width = fImageExtent.width,
-			.height = fImageExtent.height,
-			.depth = 1
-		},
-		.mipLevels = 1,
-		.arrayLayers = 1,
-		.samples = VK_SAMPLE_COUNT_1_BIT,
-		.tiling = VK_IMAGE_TILING_LINEAR,
-		.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
-	};
-	fBuffer.SetTo(new(std::nothrow) VKLayerImage());
-	if (!fBuffer.IsSet())
-		return VK_ERROR_OUT_OF_HOST_MEMORY;
-	area_id area;
-	VkCheckRet(fBuffer->Init(fDevice, createInfo, true, &area));
-	fBitmapArea.SetTo(area);
-
-	VkImageSubresource subResource{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT};
-	VkSubresourceLayout subResourceLayout;
-	fDevice->Hooks().GetImageSubresourceLayout(fDevice->ToHandle(), fBuffer->ToHandle(), &subResource, &subResourceLayout);
-	fBitmap.SetTo(new(std::nothrow) BBitmap(fBitmapArea.Get(), 0, BRect(0, 0, fImageExtent.width - 1, fImageExtent.height - 1), B_BITMAP_IS_AREA, B_RGB32, subResourceLayout.rowPitch));
-	if (!fBitmap.IsSet())
-		return VK_ERROR_OUT_OF_HOST_MEMORY;
-	fCurBitmap = fBitmap.Get();
-
-	return VK_SUCCESS;
-}
-
-VkResult VKLayerSwapchain::CopyToBuffer(VkImage srcImage, int32_t width, int32_t height)
-{
-	// Do the actual blit from the offscreen image to our host visible destination image
-	VkCommandBufferAllocateInfo cmdBufAllocateInfo{
-		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-		.commandPool = fCommandPool,
-		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-		.commandBufferCount = 1
-	};
-	VkCommandBuffer copyCmd;
-	VkCheckRet(fDevice->Hooks().AllocateCommandBuffers(fDevice->ToHandle(), &cmdBufAllocateInfo, &copyCmd));
-	VkCommandBufferBeginInfo cmdBufInfo{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-	VkCheckRet(fDevice->Hooks().BeginCommandBuffer(copyCmd, &cmdBufInfo));
-
-	// Transition destination image to transfer destination layout
-	insertImageMemoryBarrier(
-		fDevice,
-		copyCmd,
-		fBuffer->ToHandle(),
-		0,
-		VK_ACCESS_TRANSFER_WRITE_BIT,
-		VK_IMAGE_LAYOUT_UNDEFINED,
-		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		VK_PIPELINE_STAGE_TRANSFER_BIT,
-		VK_PIPELINE_STAGE_TRANSFER_BIT,
-		VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
-	);
-
-	VkOffset3D blitSize{.x = width, .y = height, .z = 1};
-	VkImageBlit imageBlitRegion{
-		.srcSubresource = {
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-			.layerCount = 1
-		},
-		.srcOffsets = {{}, blitSize},
-		.dstSubresource = {
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-			.layerCount = 1,
-		},
-		.dstOffsets = {{}, blitSize}
-	};
-
-	// Issue the blit command
-	fDevice->Hooks().CmdBlitImage(
-		copyCmd,
-		srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		fBuffer->ToHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		1,
-		&imageBlitRegion,
-		VK_FILTER_NEAREST
-	);
-
-	// Transition destination image to general layout, which is the required layout for mapping the image memory later on
-	insertImageMemoryBarrier(
-		fDevice,
-		copyCmd,
-		fBuffer->ToHandle(),
-		VK_ACCESS_TRANSFER_WRITE_BIT,
-		VK_ACCESS_MEMORY_READ_BIT,
-		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		VK_IMAGE_LAYOUT_GENERAL,
-		VK_PIPELINE_STAGE_TRANSFER_BIT,
-		VK_PIPELINE_STAGE_TRANSFER_BIT,
-		VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
-	);
-
-	VkCheckRet(fDevice->Hooks().EndCommandBuffer(copyCmd));
-
-	VkCheckRet(submitWork(fDevice, copyCmd, fQueue));
-	fDevice->Hooks().FreeCommandBuffers(fDevice->ToHandle(), fCommandPool, 1, &copyCmd);
-
-	return VK_SUCCESS;
-}
-
 VkResult VKLayerSwapchain::CheckSuboptimal()
 {
+#if 0
 	auto bitmapHook = fSurface->GetBitmapHook();
 	if (bitmapHook == NULL)
 		return VK_SUCCESS;
@@ -624,7 +520,7 @@ VkResult VKLayerSwapchain::CheckSuboptimal()
 
 	if (!(fImageExtent.width == width && fImageExtent.height == height))
 		return VK_SUBOPTIMAL_KHR;
-
+#endif
 	return VK_SUCCESS;
 }
 
@@ -652,36 +548,34 @@ VkResult VKLayerSwapchain::Init(LayerDevice *device, const VkSwapchainCreateInfo
 	fImages.SetTo(new(std::nothrow) VKLayerImage[fImageCnt]);
 	if (!fImages.IsSet())
 		return VK_ERROR_OUT_OF_HOST_MEMORY;
-	if(!fImagePool.SetMaxLen(fImageCnt))
-		return VK_ERROR_OUT_OF_HOST_MEMORY;
 
 	for (uint32_t i = 0; i < fImageCnt; i++) {
 		VkCheckRet(fImages[i].Init(device, imageCreateInfo));
-		fImagePool.Add(i);
 	}
 
 	fDevice->Hooks().GetDeviceQueue(fDevice->ToHandle(), 0, 0, &fQueue);
-	//VkCheckRet(vkSetDeviceLoaderData(device, fQueue));
 
-	VkCheckRet(CreateBuffer());
+	ArrayDeleter<VideoBuffer> vidBufs(new VideoBuffer[fImageCnt]);
+	for (uint32 i = 0; i < fImageCnt; i++) {
+		memset(&vidBufs[i], 0, sizeof(VideoBuffer));
+		vidBufs[i].id = i;
+		VkCheckRet(fImages[i].ToVideoBuffer(vidBufs[i], imageCreateInfo));
+	}
+	SwapChain swapChain {
+		.size = sizeof(SwapChain),
+		.presentEffect = presentEffectSwap,
+		.bufferCnt = fImageCnt,
+		.buffers = &vidBufs[0]
+	};
+
+	fSurface->LockLooper();
+	fSurface->SetSwapChain(&swapChain);
+	fSurface->UnlockLooper();
 
 	if (oldSwapchain != NULL) {
 		oldSwapchain->fRetired = true;
 	}
 	fSurface->fSwapchain = this;
-
-	if (false) {
-		fSurface->LockLooper();
-		SwapChainSpec spec {
-			.size = sizeof(SwapChainSpec),
-			.presentEffect = presentEffectSwap,
-			.bufferCnt = 2,
-			.kind = bufferRefGpu,
-			.colorSpace = B_RGBA32,
-		};
-		fSurface->RequestSwapChain(spec);
-		fSurface->UnlockLooper();
-	}
 
 	return VK_SUCCESS;
 }
@@ -703,7 +597,14 @@ VkResult VKLayerSwapchain::GetSwapchainImages(uint32_t *count, VkImage *images)
 
 VkResult VKLayerSwapchain::AcquireNextImage(const VkAcquireNextImageInfoKHR *pAcquireInfo, uint32_t *pImageIndex)
 {
-	int32 imageIdx = fImagePool.Remove();
+	int32 imageIdx = -1;
+	for (;;) {
+		fSurface->LockLooper();
+		imageIdx = fSurface->AllocBuffer();
+		fSurface->UnlockLooper();
+		if (imageIdx >= 0) break;
+		snooze(1000);
+	}
 	*pImageIndex = imageIdx;
 
 	if (VK_NULL_HANDLE != pAcquireInfo->semaphore || VK_NULL_HANDLE != pAcquireInfo->fence) {
@@ -713,7 +614,7 @@ VkResult VKLayerSwapchain::AcquireNextImage(const VkAcquireNextImageInfoKHR *pAc
 			submit.signalSemaphoreCount = 1;
 			submit.pSignalSemaphores = &pAcquireInfo->semaphore;
 		}
-	
+
 		submit.commandBufferCount = 0;
 		submit.pCommandBuffers = nullptr;
 		VkCheckRet(fDevice->Hooks().QueueSubmit(fQueue, 1, &submit, pAcquireInfo->fence));
@@ -737,17 +638,10 @@ VkResult VKLayerSwapchain::QueuePresent(VkQueue queue, const VkPresentInfoKHR *p
 	}
 
 	uint32_t imageIdx = presentInfo->pImageIndices[idx];
-	/*assert(*/fImagePool.Add(imageIdx)/*)*/;
 
-	auto bitmapHook = fSurface->GetBitmapHook();
-	if (bitmapHook != NULL) {
-		CopyToBuffer(fImages[imageIdx].ToHandle(), fImageExtent.width, fImageExtent.height);
-		if (fBitmap.IsSet()) {
-			delete bitmapHook->SetBitmap(fBitmap.Detach());
-		} else {
-			bitmapHook->SetBitmap(fCurBitmap);
-		}
-	}
+	fSurface->LockLooper();
+	fSurface->Present(imageIdx);
+	fSurface->UnlockLooper();
 
 	return CheckSuboptimal();
 }

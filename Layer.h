@@ -38,7 +38,8 @@
 	REQUIRED(CmdPipelineBarrier) \
 	REQUIRED(EndCommandBuffer) \
 	REQUIRED(QueueSubmit) \
-	REQUIRED(QueueWaitIdle)
+	REQUIRED(QueueWaitIdle) \
+	REQUIRED(GetMemoryFdKHR)
 
 
 struct InstanceHooks {
