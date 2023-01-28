@@ -8,12 +8,14 @@
 
 
 #define INSTANCE_HOOK_LIST(REQUIRED, OPTIONAL) \
+	REQUIRED(DestroyInstance) \
 	REQUIRED(EnumerateDeviceExtensionProperties) \
 	REQUIRED(GetPhysicalDeviceImageFormatProperties) \
 	REQUIRED(GetPhysicalDeviceMemoryProperties) \
 	REQUIRED(GetPhysicalDeviceProperties)
 
 #define DEVICE_HOOK_LIST(REQUIRED, OPTIONAL) \
+	REQUIRED(DestroyDevice) \
 	REQUIRED(AllocateCommandBuffers) \
 	REQUIRED(AllocateMemory) \
 	REQUIRED(BindImageMemory) \

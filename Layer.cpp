@@ -100,16 +100,16 @@ LayerDevice::~LayerDevice()
 VkResult LayerDevice::Init(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice)
 {
 	fPhysDev = physicalDevice;
-	
+
 	VkLayerDeviceCreateInfo *layerCreateInfo = (VkLayerDeviceCreateInfo *)pCreateInfo->pNext;
 	while (layerCreateInfo && !(layerCreateInfo->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO && layerCreateInfo->function == VK_LAYER_LINK_INFO)) {
 		layerCreateInfo = (VkLayerDeviceCreateInfo *)layerCreateInfo->pNext;
 	}
-	
+
 	if (layerCreateInfo == NULL) {
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
-	
+
 	fHooks.GetInstanceProcAddr = layerCreateInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
 	fHooks.GetDeviceProcAddr = layerCreateInfo->u.pLayerInfo->pfnNextGetDeviceProcAddr;
 	// move chain on for next layer
@@ -164,8 +164,14 @@ static void VKAPI_CALL Layer_DestroyInstance(VkInstance instance, const VkAlloca
 {
 	(void)pAllocator;
 	printf("VideoStreamsWsi: vkDestroyInstance\n");
-	PthreadMutexLocker lock(&sInstanceMapLock);
-	sInstanceMap.erase(sInstanceMap.find(instance));
+	ObjectDeleter<LayerInstance> layerInst;
+	{
+		PthreadMutexLocker lock(&sInstanceMapLock);
+		auto it = sInstanceMap.find(instance);
+		layerInst.SetTo(it->second.Detach());
+		sInstanceMap.erase(it);
+	}
+	layerInst->Hooks().DestroyInstance(instance, pAllocator);
 }
 
 static VkResult VKAPI_CALL Layer_EnumerateInstanceLayerProperties(uint32_t *pCount, VkLayerProperties *pProperties)
@@ -185,16 +191,16 @@ static VkResult VKAPI_CALL Layer_EnumerateInstanceLayerProperties(uint32_t *pCou
 static VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice)
 {
 	printf("VideoStreamsWsi: vkCreateDevice\n");
-	
+
 	printf("instance: %p\n", *(void**)physicalDevice);
-	
+
 	ObjectDeleter<LayerDevice> layerDev(new LayerDevice(LayerInstance::FromPhysDev(physicalDevice)));
 	VkCheckRet(layerDev->Init(physicalDevice, pCreateInfo, pAllocator, pDevice));
-	
+
 	PthreadMutexLocker lock(&sDeviceMapLock);
 	sDeviceMap.emplace(layerDev->ToHandle(), layerDev.Get());
 	layerDev.Detach();
-	
+
 	return VK_SUCCESS;
 }
 
@@ -202,8 +208,14 @@ static void VKAPI_CALL Layer_DestroyDevice(VkDevice device, const VkAllocationCa
 {
 	(void)pAllocator;
 	printf("VideoStreamsWsi: vkDestroyDevice\n");
-	PthreadMutexLocker lock(&sDeviceMapLock);
-	sDeviceMap.erase(sDeviceMap.find(device));
+	ObjectDeleter<LayerDevice> layerDev;
+	{
+		PthreadMutexLocker lock(&sDeviceMapLock);
+		auto it = sDeviceMap.find(device);
+		layerDev.SetTo(it->second.Detach());
+		sDeviceMap.erase(it);
+	}
+	layerDev->Hooks().DestroyDevice(device, pAllocator);
 }
 
 static VkResult VKAPI_CALL Layer_EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char *pLayerName, uint32_t *pCount, VkExtensionProperties *pProperties)
